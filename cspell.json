@@ -1,0 +1,30 @@
+{
+  "version": "0.2",
+  "language": "en,zh-CN",
+  "words": [
+    "agent_solution",
+    "cSpell",
+    "conda",
+    "embeddings",
+    "FastAPI",
+    "FTS5",
+    "GreatRouter",
+    "GREATEROUTE",
+    "GREATROUTER",
+    "langchain",
+    "LangChain",
+    "langgraph",
+    "LangGraph",
+    "langgraph_app",
+    "langsmith",
+    "MCP",
+    "OpenAI",
+    "Pydantic",
+    "pyproject",
+    "pytest",
+    "SQLite",
+    "vLLM",
+    "venv",
+    "VLLM"
+  ]
+}

@@ -1,0 +1,12 @@
+.agent_solution/
+.langgraph_api/
+.venv/
+.env*
+!.env.example
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.DS_Store
+!.vscode/
+!.vscode/settings.json

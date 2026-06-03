@@ -1,0 +1,11 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "agent_solution": "./src/agent_solution/langgraph_app.py:graph",
+    "agent_solution_chat": "./src/agent_solution/langgraph_app.py:chat_graph"
+  },
+  "env": {
+    "AGENT_SOLUTION_SIMULATE": "false"
+  },
+  "python_version": "3.12"
+}
