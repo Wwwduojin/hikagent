@@ -12,8 +12,10 @@ class Settings:
     chat_model: str
     embed_model: str
     api_key: str | None = None
+    checkpoint_db_path: Path = Path(".agent_solution") / "checkpoints.sqlite"
     chunk_size: int = 900
     chunk_overlap: int = 120
+    plan_mode: str = "simulate"
 
     @property
     def vllm_base_url(self) -> str:
@@ -34,6 +36,7 @@ class Settings:
     @classmethod
     def from_env(cls) -> "Settings":
         default_db = Path(".agent_solution") / "agent_solution.sqlite"
+        default_checkpoint_db = Path(".agent_solution") / "checkpoints.sqlite"
         api_key = (
             os.getenv("GREATROUTER_API_KEY")
             or os.getenv("GREATEROUTE_API_KEY")
@@ -42,6 +45,7 @@ class Settings:
         )
         return cls(
             db_path=Path(os.getenv("AGENT_SOLUTION_DB", default_db)),
+            checkpoint_db_path=Path(os.getenv("AGENT_SOLUTION_CHECKPOINT_DB", default_checkpoint_db)),
             model_base_url=(
                 os.getenv("GREATROUTER_BASE_URL")
                 or os.getenv("GREATEROUTE_BASE_URL")
@@ -63,6 +67,7 @@ class Settings:
             api_key=api_key,
             chunk_size=int(os.getenv("AGENT_SOLUTION_CHUNK_SIZE", "900")),
             chunk_overlap=int(os.getenv("AGENT_SOLUTION_CHUNK_OVERLAP", "120")),
+            plan_mode=os.getenv("AGENT_SOLUTION_PLAN_MODE", "simulate").lower(),
         )
 
 

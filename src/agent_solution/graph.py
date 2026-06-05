@@ -3,14 +3,28 @@ from __future__ import annotations
 import json
 from typing import Any, Callable, Literal
 
-from langchain_core.messages import BaseMessage
 from langgraph.graph import END, StateGraph
-from langgraph.graph.message import MessagesState
 
+from agent_solution.agents.knowledge_base import build_knowledge_base_subgraph as _build_knowledge_base_subgraph
+from agent_solution.agents.intent_recognition import build_intent_router_graph
+from agent_solution.agents.recommendation import build_recommendation_subgraph as _build_recommendation_subgraph
+from agent_solution.agents.supervisor import build_supervisor_subgraph as _build_supervisor_subgraph
+from agent_solution.agents.tool_orchestration import (
+    build_tool_orchestration_subgraph as _build_tool_orchestration_subgraph,
+)
 from agent_solution.kb import KnowledgeBase
 from agent_solution.llm import OpenAICompatibleClient, parse_json_object
+from agent_solution.algorithm_planner import AlgorithmPlanner, SimulatedAlgorithmPlanner
+from agent_solution.graph_state import (
+    GraphState,
+    agent_state_from_graph,
+    coerce_message,
+    node_adapter,
+)
 from agent_solution.models import (
     AgentState,
+    AlgorithmPlan,
+    AlgorithmPlanRequest,
     AlgorithmSlots,
     ChatMessage,
     KnowledgeCase,
@@ -23,82 +37,117 @@ from agent_solution.tools import ToolRegistry
 KB_MATCH_THRESHOLD = 0.20
 
 
-class GraphState(MessagesState, total=False):
-    slots: dict[str, Any]
-    missing_slots: list[str]
-    missing_required_slots: list[str]
-    missing_optional_slots: list[str]
-    stage: str
-    active_agent: str
-    kb_context: list[dict[str, Any]]
-    kb_cases: list[dict[str, Any]]
-    kb_has_match: bool
-    user_satisfaction: str
-    recommended_solution: dict[str, Any] | None
-    recommended_solution_reason: str | None
-    draft_summary_markdown: str | None
-    draft_solution_json: dict[str, Any] | None
-    assistant_reply: str | None
-    status: Literal["collecting", "reviewing", "confirmed"]
-    tool_calls: list[dict[str, Any]]
-
-
-def build_graph(llm: OpenAICompatibleClient, kb: KnowledgeBase, tools: ToolRegistry):
+def build_graph(
+    llm: OpenAICompatibleClient,
+    kb: KnowledgeBase,
+    tools: ToolRegistry,
+    planner: AlgorithmPlanner | None = None,
+    checkpointer: Any | None = None,
+):
+    planner = planner or SimulatedAlgorithmPlanner()
+    supervisor = build_supervisor_subgraph(llm, tools)
+    knowledge_base = build_knowledge_base_subgraph(llm, kb)
+    recommendation = build_recommendation_subgraph(llm, planner)
+    tool_orchestration = build_tool_orchestration_subgraph()
     workflow = StateGraph(GraphState)
-    workflow.add_node("extract_slots", _node(extract_slots(llm)))
-    workflow.add_node("supervisor_route", _node(supervisor_route()))
-    workflow.add_node("knowledge_base_agent", _node(knowledge_base_agent(llm, kb)))
-    workflow.add_node("present_kb_cases", _node(present_kb_cases(llm)))
-    workflow.add_node("handle_kb_feedback", _node(handle_kb_feedback()))
-    workflow.add_node("recommendation_agent", _node(recommendation_agent(llm)))
-    workflow.add_node("ask_followup", _node(ask_followup(llm)))
-    workflow.add_node("generate_summary", _node(generate_summary(llm)))
-    workflow.add_node("confirm_solution", _node(confirm_solution()))
-    workflow.add_node("tool_router", _node(tool_router(tools)))
+    workflow.add_node("supervisor_agent", supervisor)
+    workflow.add_node("knowledge_base_agent", knowledge_base)
+    workflow.add_node("recommendation_agent", recommendation)
+    workflow.add_node("tool_orchestration_agent", tool_orchestration)
 
-    workflow.set_entry_point("extract_slots")
-    workflow.add_edge("extract_slots", "supervisor_route")
+    workflow.set_entry_point("supervisor_agent")
     workflow.add_conditional_edges(
-        "supervisor_route",
-        supervisor_decision,
+        "supervisor_agent",
+        parent_agent_decision,
         {
             "knowledge_base_agent": "knowledge_base_agent",
-            "handle_kb_feedback": "handle_kb_feedback",
             "recommendation_agent": "recommendation_agent",
-            "ask_followup": "ask_followup",
-            "generate_summary": "generate_summary",
-            "confirm_solution": "confirm_solution",
+            "tool_orchestration_agent": "tool_orchestration_agent",
+            "end": END,
         },
     )
     workflow.add_conditional_edges(
         "knowledge_base_agent",
-        knowledge_result_decision,
+        parent_agent_decision,
         {
-            "present_kb_cases": "present_kb_cases",
             "recommendation_agent": "recommendation_agent",
+            "tool_orchestration_agent": "tool_orchestration_agent",
+            "end": END,
         },
     )
     workflow.add_conditional_edges(
-        "handle_kb_feedback",
-        feedback_decision,
+        "recommendation_agent",
+        parent_agent_decision,
         {
-            "knowledge_base_agent": "knowledge_base_agent",
-            "recommendation_agent": "recommendation_agent",
-            "ask_followup": "ask_followup",
-            "generate_summary": "generate_summary",
+            "tool_orchestration_agent": "tool_orchestration_agent",
+            "end": END,
         },
     )
-    workflow.add_edge("present_kb_cases", END)
-    workflow.add_edge("recommendation_agent", END)
-    workflow.add_edge("ask_followup", END)
-    workflow.add_edge("generate_summary", "tool_router")
-    workflow.add_edge("tool_router", END)
-    workflow.add_edge("confirm_solution", END)
-    return workflow.compile()
+    workflow.add_conditional_edges(
+        "tool_orchestration_agent",
+        parent_agent_decision,
+        {
+            "end": END,
+        },
+    )
+    return workflow.compile(checkpointer=checkpointer)
 
 
-def build_chat_graph(llm: OpenAICompatibleClient, kb: KnowledgeBase, tools: ToolRegistry):
-    return build_graph(llm, kb, tools)
+def build_chat_graph(
+    llm: OpenAICompatibleClient,
+    kb: KnowledgeBase,
+    tools: ToolRegistry,
+    planner: AlgorithmPlanner | None = None,
+):
+    return build_graph(llm, kb, tools, planner=planner)
+
+
+def build_supervisor_subgraph(llm: OpenAICompatibleClient, tools: ToolRegistry):
+    return _build_supervisor_subgraph(
+        extract_slots=_node(extract_slots(llm)),
+        supervisor_route=_node(supervisor_route()),
+        handle_kb_feedback=_node(handle_kb_feedback()),
+        ask_followup=_node(ask_followup(llm)),
+        generate_summary=_node(generate_summary(llm)),
+        tool_router=_node(tool_router(tools)),
+        confirm_solution=_node(confirm_solution()),
+        supervisor_decision=supervisor_decision,
+        feedback_decision=feedback_decision,
+        delegate_knowledge_base=_node(delegate_knowledge_base()),
+        delegate_recommendation=_node(delegate_recommendation()),
+    )
+
+
+def build_knowledge_base_subgraph(llm: OpenAICompatibleClient, kb: KnowledgeBase):
+    return _build_knowledge_base_subgraph(
+        retrieve_knowledge=_node(retrieve_knowledge(kb)),
+        summarize_knowledge_cases=_node(summarize_knowledge_cases(llm)),
+        present_kb_cases=_node(present_kb_cases(llm)),
+        knowledge_result_decision=knowledge_result_decision,
+        delegate_recommendation=_node(delegate_recommendation()),
+    )
+
+
+def build_recommendation_subgraph(llm: OpenAICompatibleClient, planner: AlgorithmPlanner):
+    return _build_recommendation_subgraph(
+        check_recommendation_requirements=_node(check_recommendation_requirements()),
+        recommendation_followup=_node(recommendation_followup(llm)),
+        build_algorithm_plan_request=_node(build_algorithm_plan_request()),
+        algorithm_plan_api_tool=_node(algorithm_plan_api_tool(planner)),
+        normalize_algorithm_plan=_node(normalize_algorithm_plan()),
+        present_recommendation=_node(present_recommendation()),
+        recommendation_decision=recommendation_decision,
+    )
+
+
+def build_tool_orchestration_subgraph():
+    return _build_tool_orchestration_subgraph(
+        tool_recall_node=_node(tool_recall_node()),
+        planning_agent=_node(planning_agent()),
+        topology_agent=_node(topology_agent()),
+        parameter_agent=_node(parameter_agent()),
+        judge_agent=_node(judge_agent()),
+    )
 
 
 def initial_state() -> GraphState:
@@ -106,65 +155,20 @@ def initial_state() -> GraphState:
 
 
 def append_user_message(state: GraphState, content: str) -> GraphState:
-    agent_state = _agent_state_from_graph(state)
+    agent_state = agent_state_from_graph(state)
     agent_state.messages.append(ChatMessage(role="user", content=content))
     return agent_state.model_dump()
 
 
-def _node(func: Callable[[AgentState], AgentState]) -> Callable[[GraphState], GraphState]:
-    def wrapped(state: GraphState) -> GraphState:
-        before = _agent_state_from_graph(state)
-        previous_message_count = len(before.messages)
-        after = func(before)
-        return _graph_update(previous_message_count, after)
-
-    return wrapped
+_node = node_adapter
+_agent_state_from_graph = agent_state_from_graph
+_coerce_message = coerce_message
 
 
-def _agent_state_from_graph(state: GraphState) -> AgentState:
-    data = dict(state)
-    data["messages"] = [_coerce_message(message) for message in data.get("messages", [])]
-    return AgentState.model_validate(data)
-
-
-def _coerce_message(message: Any) -> dict[str, str]:
-    role_map = {
-        "ai": "assistant",
-        "assistant": "assistant",
-        "human": "user",
-        "user": "user",
-        "system": "system",
-    }
-    if isinstance(message, ChatMessage):
-        return message.model_dump()
-    if isinstance(message, BaseMessage):
-        return {"role": role_map.get(message.type, "user"), "content": _string_content(message.content)}
-    if isinstance(message, dict):
-        role = message.get("role") or message.get("type") or "user"
-        return {"role": role_map.get(str(role), "user"), "content": _string_content(message.get("content", ""))}
-    return {"role": "user", "content": str(message)}
-
-
-def _string_content(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        text_parts = [
-            item.get("text", "")
-            for item in content
-            if isinstance(item, dict) and item.get("type") == "text"
-        ]
-        if text_parts:
-            return "\n".join(part for part in text_parts if part)
-    return json.dumps(content, ensure_ascii=False)
-
-
-def _graph_update(previous_message_count: int, after: AgentState) -> GraphState:
-    update = after.model_dump()
-    new_messages = update.pop("messages")[previous_message_count:]
-    if new_messages:
-        update["messages"] = new_messages
-    return update
+def parent_agent_decision(state: GraphState) -> str:
+    if state.get("turn_complete"):
+        return "end"
+    return state.get("next_agent") or "end"
 
 
 def extract_slots(llm: OpenAICompatibleClient) -> Callable[[AgentState], AgentState]:
@@ -174,6 +178,7 @@ def extract_slots(llm: OpenAICompatibleClient) -> Callable[[AgentState], AgentSt
             "existing_slots": state.slots.model_dump(),
             "latest_user_message": user_messages[-1].content if user_messages else "",
             "user_message_history": [msg.content for msg in user_messages],
+            "summary": state.summary,
         }
         prompt = [
             {
@@ -199,6 +204,8 @@ def extract_slots(llm: OpenAICompatibleClient) -> Callable[[AgentState], AgentSt
 def supervisor_route() -> Callable[[AgentState], AgentState]:
     def run(state: AgentState) -> AgentState:
         state.active_agent = "supervisor"
+        state.next_agent = None
+        state.turn_complete = False
         latest = latest_user_message(state).strip().lower()
         if state.stage == "reviewing" and latest in {"yes", "y", "确认", "同意"}:
             state.status = "confirmed"
@@ -213,20 +220,40 @@ def supervisor_decision(state: GraphState) -> str:
     if agent_state.status == "confirmed":
         return "confirm_solution"
     if agent_state.stage in {"intake", "kb_retrieval"}:
-        return "knowledge_base_agent"
+        return "delegate_knowledge_base"
     if agent_state.stage in {"kb_feedback", "kb_satisfaction_check"}:
         return "handle_kb_feedback"
     if agent_state.stage == "recommendation":
-        return "recommendation_agent"
+        return "delegate_recommendation"
     if agent_state.slots.is_ready():
         return "generate_summary"
     return "ask_followup"
 
 
-def knowledge_base_agent(llm: OpenAICompatibleClient, kb: KnowledgeBase) -> Callable[[AgentState], AgentState]:
+def delegate_knowledge_base() -> Callable[[AgentState], AgentState]:
+    def run(state: AgentState) -> AgentState:
+        state.next_agent = "knowledge_base_agent"
+        state.turn_complete = False
+        return state
+
+    return run
+
+
+def delegate_recommendation() -> Callable[[AgentState], AgentState]:
+    def run(state: AgentState) -> AgentState:
+        state.next_agent = "recommendation_agent"
+        state.turn_complete = False
+        return state
+
+    return run
+
+
+def retrieve_knowledge(kb: KnowledgeBase) -> Callable[[AgentState], AgentState]:
     def run(state: AgentState) -> AgentState:
         state.active_agent = "knowledge_base_agent"
         state.stage = "kb_retrieval"
+        state.next_agent = None
+        state.turn_complete = False
         query = build_knowledge_query(state)
         hits = kb.search(query, mode="hybrid", top_k=4) if query else []
         state.kb_context = [hit for hit in hits if hit.hybrid_score >= KB_MATCH_THRESHOLD]
@@ -234,11 +261,21 @@ def knowledge_base_agent(llm: OpenAICompatibleClient, kb: KnowledgeBase) -> Call
         if not state.kb_context:
             state.kb_has_match = False
             state.stage = "recommendation"
+        return state
+
+    return run
+
+
+def summarize_knowledge_cases(llm: OpenAICompatibleClient) -> Callable[[AgentState], AgentState]:
+    def run(state: AgentState) -> AgentState:
+        if not state.kb_context:
+            state.kb_has_match = False
+            state.stage = "recommendation"
             return state
 
         payload = {
             "requirements": state.slots.model_dump(),
-            "query": query,
+            "query": build_knowledge_query(state),
             "hits": [
                 {"source": hit.source, "content": hit.content, "score": hit.hybrid_score}
                 for hit in state.kb_context
@@ -263,7 +300,7 @@ def knowledge_base_agent(llm: OpenAICompatibleClient, kb: KnowledgeBase) -> Call
 
 def knowledge_result_decision(state: GraphState) -> str:
     agent_state = _agent_state_from_graph(state)
-    return "present_kb_cases" if agent_state.kb_has_match and agent_state.kb_cases else "recommendation_agent"
+    return "present_kb_cases" if agent_state.kb_has_match and agent_state.kb_cases else "delegate_recommendation"
 
 
 def present_kb_cases(llm: OpenAICompatibleClient) -> Callable[[AgentState], AgentState]:
@@ -282,6 +319,8 @@ def present_kb_cases(llm: OpenAICompatibleClient) -> Callable[[AgentState], Agen
         state.user_satisfaction = "unknown"
         state.stage = "kb_satisfaction_check"
         state.status = "collecting"
+        state.next_agent = "end"
+        state.turn_complete = True
         return state
 
     return run
@@ -315,66 +354,132 @@ def handle_kb_feedback() -> Callable[[AgentState], AgentState]:
 def feedback_decision(state: GraphState) -> str:
     agent_state = _agent_state_from_graph(state)
     if agent_state.user_satisfaction == "unsatisfied":
-        return "recommendation_agent"
+        return "delegate_recommendation"
     if agent_state.user_satisfaction == "unknown":
-        return "knowledge_base_agent"
+        return "delegate_knowledge_base"
     if agent_state.slots.is_ready():
         return "generate_summary"
     return "ask_followup"
 
 
-def recommendation_agent(llm: OpenAICompatibleClient) -> Callable[[AgentState], AgentState]:
+def check_recommendation_requirements() -> Callable[[AgentState], AgentState]:
     def run(state: AgentState) -> AgentState:
         state.active_agent = "recommendation_agent"
         state.stage = "recommendation"
-        missing_requirements = state.slots.missing_recommendation_requirements()
-        if missing_requirements:
-            followup_payload = {
-                "known_slots": state.slots.model_dump(),
-                "missing_recommendation_requirements": missing_requirements,
-                "user_feedback": latest_user_message(state),
-            }
-            followup_prompt = [
-                {"role": "system", "content": load_prompt("recommendation_followup.md")},
-                {"role": "user", "content": json.dumps(followup_payload, ensure_ascii=False)},
-            ]
-            try:
-                reply = llm.chat(followup_prompt, temperature=0.2)
-            except Exception:
-                reply = fallback_recommendation_followup(missing_requirements)
-            state.assistant_reply = reply
-            state.messages.append(ChatMessage(role="assistant", content=reply))
-            state.status = "collecting"
-            return state
+        state.next_agent = None
+        state.turn_complete = False
+        return state
 
-        payload = {
-            "requirements": state.slots.model_dump(),
-            "knowledge_cases": [case.model_dump() for case in state.kb_cases],
-            "knowledge_hits": [
-                {"source": hit.source, "content": hit.content, "score": hit.hybrid_score}
-                for hit in state.kb_context
-            ],
+    return run
+
+
+def recommendation_followup(llm: OpenAICompatibleClient) -> Callable[[AgentState], AgentState]:
+    def run(state: AgentState) -> AgentState:
+        missing_requirements = state.slots.missing_recommendation_requirements()
+        followup_payload = {
+            "known_slots": state.slots.model_dump(),
+            "missing_recommendation_requirements": missing_requirements,
             "user_feedback": latest_user_message(state),
         }
-        prompt = [
-            {"role": "system", "content": load_prompt("recommendation_agent.md")},
-            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        followup_prompt = [
+            {"role": "system", "content": load_prompt("recommendation_followup.md")},
+            {"role": "user", "content": json.dumps(followup_payload, ensure_ascii=False)},
         ]
         try:
-            data = parse_json_object(llm.chat(prompt, temperature=0.2))
-            solution = RecommendedSolution.model_validate(data)
+            reply = llm.chat(followup_prompt, temperature=0.2)
         except Exception:
-            solution = fallback_recommendation(state)
+            reply = fallback_recommendation_followup(missing_requirements)
+        state.assistant_reply = reply
+        state.messages.append(ChatMessage(role="assistant", content=reply))
+        state.status = "collecting"
+        state.next_agent = "end"
+        state.turn_complete = True
+        return state
+
+    return run
+
+
+def recommendation_decision(state: GraphState) -> str:
+    agent_state = _agent_state_from_graph(state)
+    return "build_algorithm_plan_request" if agent_state.slots.is_ready_for_recommendation() else "recommendation_followup"
+
+
+def build_algorithm_plan_request() -> Callable[[AgentState], AgentState]:
+    def run(state: AgentState) -> AgentState:
+        slots = state.slots
+        state.algorithm_main_description = "；".join(
+            part
+            for part in [
+                slots.problem_goal,
+                f"输入：{slots.inputs}" if slots.inputs else None,
+                f"输出：{slots.outputs}" if slots.outputs else None,
+                f"约束：{slots.constraints}" if slots.constraints else None,
+                f"指标：{slots.metrics}" if slots.metrics else None,
+            ]
+            if part
+        )
+        state.algorithm_plan_request = AlgorithmPlanRequest(
+            algorithm_name=state.current_app_name or slots.problem_goal or "算法应用",
+            algorithm_description=state.algorithm_main_description,
+            input_data=split_values(slots.inputs),
+            output_target=split_values(slots.outputs),
+            constraints=split_values(slots.constraints),
+            metrics=split_values(slots.metrics),
+            kb_context=[case.core_flow for case in state.kb_cases] or [hit.content for hit in state.kb_context[:3]],
+            user_profile=state.user_profile.model_dump(exclude_none=True),
+        )
+        return state
+
+    return run
+
+
+def algorithm_plan_api_tool(planner: AlgorithmPlanner) -> Callable[[AgentState], AgentState]:
+    def run(state: AgentState) -> AgentState:
+        if not state.algorithm_plan_request:
+            return state
+        state.algorithm_plan_raw_response = planner.generate(state.algorithm_plan_request)
+        return state
+
+    return run
+
+
+def normalize_algorithm_plan() -> Callable[[AgentState], AgentState]:
+    def run(state: AgentState) -> AgentState:
+        try:
+            plan = AlgorithmPlan.model_validate(state.algorithm_plan_raw_response or {})
+        except Exception:
+            fallback = SimulatedAlgorithmPlanner()
+            plan = AlgorithmPlan.model_validate(fallback.generate(state.algorithm_plan_request))
+        state.algorithm_plan_normalized = plan
+        core_approach = "；".join(f"{step.step_name}：{step.description}" for step in plan.pipeline)
+        solution = RecommendedSolution(
+            name=plan.solution_name,
+            fit_reason=plan.overall_idea,
+            core_approach=core_approach,
+            preconditions=json.dumps(plan.deployment, ensure_ascii=False),
+            open_questions=[],
+            plan=plan,
+        )
         state.recommended_solution = solution
         state.recommended_solution_reason = solution.fit_reason
-        state.slots.core_steps = solution.core_approach
+        state.slots.core_steps = core_approach
         state.missing_slots = state.slots.missing()
         state.missing_required_slots = state.slots.missing_required()
         state.missing_optional_slots = state.slots.missing_optional()
+        return state
+
+    return run
+
+
+def present_recommendation() -> Callable[[AgentState], AgentState]:
+    def run(state: AgentState) -> AgentState:
+        solution = state.recommended_solution or fallback_recommendation(state)
         state.assistant_reply = format_recommendation(solution)
         state.messages.append(ChatMessage(role="assistant", content=state.assistant_reply))
         state.stage = "solution_refinement"
         state.status = "collecting"
+        state.next_agent = "end"
+        state.turn_complete = True
         return state
 
     return run
@@ -414,6 +519,8 @@ def ask_followup(llm: OpenAICompatibleClient) -> Callable[[AgentState], AgentSta
         state.assistant_reply = reply
         state.messages.append(ChatMessage(role="assistant", content=reply))
         state.status = "collecting"
+        state.next_agent = "end"
+        state.turn_complete = True
         return state
 
     return run
@@ -450,6 +557,8 @@ def generate_summary(llm: OpenAICompatibleClient) -> Callable[[AgentState], Agen
         state.messages.append(ChatMessage(role="assistant", content=state.assistant_reply))
         state.status = "reviewing"
         state.stage = "reviewing"
+        state.next_agent = "end"
+        state.turn_complete = False
         return state
 
     return run
@@ -460,8 +569,74 @@ def confirm_solution() -> Callable[[AgentState], AgentState]:
         state.active_agent = "supervisor"
         state.status = "confirmed"
         state.stage = "confirmed"
+        state.algorithm_main_description = build_algorithm_main_description(state)
         state.assistant_reply = "方案已确认。"
         state.messages.append(ChatMessage(role="assistant", content=state.assistant_reply))
+        state.next_agent = "tool_orchestration_agent"
+        state.turn_complete = False
+        return state
+
+    return run
+
+
+def tool_recall_node() -> Callable[[AgentState], AgentState]:
+    def run(state: AgentState) -> AgentState:
+        state.active_agent = "tool_orchestration_agent"
+        state.stage = "tool_orchestration"
+        state.next_agent = None
+        state.turn_complete = False
+        state.algorithm_main_description = state.algorithm_main_description or build_algorithm_main_description(state)
+        # TODO: Replace this placeholder with the real retrieval service for tool recall.
+        state.tool_recall_result = {
+            "query": state.algorithm_main_description,
+            "candidates": [],
+            "note": "placeholder: tool recall service is not implemented yet",
+        }
+        return state
+
+    return run
+
+
+def planning_agent() -> Callable[[AgentState], AgentState]:
+    def run(state: AgentState) -> AgentState:
+        # TODO: Replace this placeholder with a Planning Agent that selects tools.
+        state.selected_tools = []
+        return state
+
+    return run
+
+
+def topology_agent() -> Callable[[AgentState], AgentState]:
+    def run(state: AgentState) -> AgentState:
+        # TODO: Replace this placeholder with a Topology Agent that arranges selected tools.
+        state.tool_topology = {
+            "description": state.algorithm_main_description,
+            "nodes": [],
+            "edges": [],
+        }
+        return state
+
+    return run
+
+
+def parameter_agent() -> Callable[[AgentState], AgentState]:
+    def run(state: AgentState) -> AgentState:
+        # TODO: Replace this placeholder with a Parameter Agent that generates tool inputs.
+        state.tool_parameters = {"parameters": {}, "note": "placeholder: parameters are not generated yet"}
+        return state
+
+    return run
+
+
+def judge_agent() -> Callable[[AgentState], AgentState]:
+    def run(state: AgentState) -> AgentState:
+        # TODO: Replace this placeholder with a Judge Agent for post-processing and validation.
+        state.orchestration_judgement = {
+            "status": "placeholder_ready",
+            "message": "tool orchestration chain completed with placeholder results",
+        }
+        state.next_agent = "end"
+        state.turn_complete = True
         return state
 
     return run
@@ -482,7 +657,10 @@ def tool_router(tools: ToolRegistry) -> Callable[[AgentState], AgentState]:
             state.draft_solution_json = state.draft_solution_json or {}
             state.draft_solution_json["tool_estimates"] = {"estimate_complexity": result}
         except Exception:
+            state.turn_complete = True
             return state
+        state.next_agent = "end"
+        state.turn_complete = True
         return state
 
     return run
@@ -490,6 +668,47 @@ def tool_router(tools: ToolRegistry) -> Callable[[AgentState], AgentState]:
 
 def latest_user_message(state: AgentState) -> str:
     return next((msg.content for msg in reversed(state.messages) if msg.role == "user"), "")
+
+
+def build_algorithm_main_description(state: AgentState) -> str:
+    """Return the one-sentence confirmed solution description passed into orchestration."""
+
+    if state.recommended_solution:
+        solution = state.recommended_solution
+        return compact_sentence(
+            f"{solution.name}，核心路线是{solution.core_approach}。"
+        )
+
+    slots = state.slots
+    parts = [
+        slots.problem_goal,
+        f"输入为{slots.inputs}" if slots.inputs else None,
+        f"输出为{slots.outputs}" if slots.outputs else None,
+        f"核心流程为{slots.core_steps}" if slots.core_steps else None,
+        f"约束为{slots.constraints}" if slots.constraints else None,
+    ]
+    description = "，".join(part for part in parts if part)
+    if description:
+        return compact_sentence(f"{description}。")
+
+    if state.draft_summary_markdown:
+        lines = [
+            line.strip(" #-\t")
+            for line in state.draft_summary_markdown.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        if lines:
+            return compact_sentence(f"{lines[0]}。")
+
+    return "基于用户确认方案进行工具召回、工具选择、拓扑编排、参数生成和后处理。"
+
+
+def compact_sentence(text: str, max_length: int = 180) -> str:
+    sentence = " ".join(text.replace("\n", " ").split())
+    sentence = sentence.rstrip("。；;,.，")
+    if len(sentence) > max_length:
+        sentence = sentence[: max_length - 1].rstrip("，；;,. ")
+    return f"{sentence}。"
 
 
 def build_knowledge_query(state: AgentState) -> str:
@@ -504,6 +723,13 @@ def build_knowledge_query(state: AgentState) -> str:
         ]
         if part
     )
+
+
+def split_values(value: str | None) -> list[str]:
+    if not value:
+        return []
+    parts = [item.strip() for item in value.replace("；", ",").replace("、", ",").split(",")]
+    return [item for item in parts if item]
 
 
 def classify_satisfaction(text: str) -> Literal["unknown", "satisfied", "unsatisfied"]:
@@ -571,14 +797,29 @@ def fallback_recommendation_followup(missing_requirements: list[str]) -> str:
 
 def format_recommendation(solution: RecommendedSolution) -> str:
     questions = "\n".join(f"- {item}" for item in solution.open_questions) or "- 暂无"
+    plan_sections = ""
+    if solution.plan:
+        pipeline = "\n".join(
+            f"{index}. **{step.step_name}**：{step.description}"
+            for index, step in enumerate(solution.plan.pipeline, 1)
+        )
+        risks = "\n".join(f"- {item}" for item in solution.plan.risks) or "- 暂无"
+        plan_sections = (
+            f"\n\n## 实施流程\n{pipeline}"
+            f"\n\n## 数据要求\n{json.dumps(solution.plan.data_requirement, ensure_ascii=False)}"
+            f"\n\n## 部署建议\n{json.dumps(solution.plan.deployment, ensure_ascii=False)}"
+            f"\n\n## 评估建议\n{json.dumps(solution.plan.evaluation, ensure_ascii=False)}"
+            f"\n\n## 主要风险\n{risks}"
+        )
     return (
         "# 推荐算法方案\n\n"
         f"## 推荐方案\n{solution.name}\n\n"
         f"## 推荐原因\n{solution.fit_reason}\n\n"
         f"## 核心技术路线\n{solution.core_approach}\n\n"
         f"## 适用前提\n{solution.preconditions}\n\n"
-        f"## 后续需要确认\n{questions}\n\n"
-        "我会基于这个推荐方案继续确认细节，形成可落地的正式方案总结。请继续补充需求。"
+        f"## 后续需要确认\n{questions}"
+        f"{plan_sections}\n\n"
+        "请确认这个推荐方案是否符合你的预期。你可以继续补充修改，确认后我会形成正式方案总结。"
     )
 
 

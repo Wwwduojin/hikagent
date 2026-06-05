@@ -6,9 +6,12 @@ from importlib import resources
 from pathlib import Path
 
 from agent_solution.config import Settings
+from agent_solution.algorithm_planner import build_algorithm_planner
 from agent_solution.kb import KnowledgeBase
 from agent_solution.llm import OpenAICompatibleClient
+from agent_solution.service import AgentSolutionService, create_sqlite_checkpointer
 from agent_solution.simulation import SMOKING_DEMO_MESSAGES, SimulatedLLMClient
+from agent_solution.storage import BusinessStore
 from agent_solution.tools import build_default_registry
 
 
@@ -22,6 +25,8 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Use deterministic local simulation instead of the configured model API.",
     )
+    chat_parser.add_argument("--user-id", default="u_001", help="User identifier used for profile and session isolation.")
+    chat_parser.add_argument("--thread-id", default=None, help="Resume an existing application thread.")
 
     demo_parser = subparsers.add_parser("demo")
     demo_parser.add_argument("demo_name", choices=["smoking"])
@@ -48,9 +53,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     kb = KnowledgeBase.from_settings(settings, embedder=llm)
     tools = build_default_registry()
+    planner = build_algorithm_planner(settings.plan_mode, llm)
 
     if args.command == "chat":
-        return run_chat(llm, kb, tools)
+        return run_chat(settings, llm, kb, tools, planner, args.user_id, args.thread_id)
     if args.command == "demo":
         return run_demo(args.demo_name, settings, llm, kb, tools)
     if args.command == "kb":
@@ -62,12 +68,12 @@ def main(argv: list[str] | None = None) -> int:
     return 1
 
 
-def run_chat(llm: OpenAICompatibleClient, kb: KnowledgeBase, tools) -> int:
-    from agent_solution.graph import append_user_message, build_graph, initial_state
-
-    graph = build_graph(llm, kb, tools)
-    state = initial_state()
-    print("Agent Solution chat started. Type /exit to quit.")
+def run_chat(settings: Settings, llm: OpenAICompatibleClient, kb: KnowledgeBase, tools, planner, user_id: str, thread_id: str | None) -> int:
+    store = BusinessStore(settings.db_path)
+    checkpointer = create_sqlite_checkpointer(str(settings.checkpoint_db_path))
+    service = AgentSolutionService(llm, kb, tools, store, planner, checkpointer=checkpointer)
+    current_thread_id = thread_id
+    print("Agent Solution chat started. Type /sessions, /use <thread_id>, or /exit.")
     while True:
         try:
             user_text = input("\nUser> ").strip()
@@ -75,11 +81,33 @@ def run_chat(llm: OpenAICompatibleClient, kb: KnowledgeBase, tools) -> int:
             break
         if user_text in {"/exit", "exit", "quit"}:
             break
+        if user_text == "/sessions":
+            sessions = service.list_sessions(user_id)
+            for session in sessions:
+                marker = "*" if session.thread_id == current_thread_id else " "
+                print(
+                    f"{marker} {session.thread_id}\t{session.app_name or session.session_type}"
+                    f"\tstage={session.stage}\tstatus={session.status}"
+                )
+            continue
+        if user_text.startswith("/use "):
+            target = user_text.removeprefix("/use ").strip()
+            session = service.get_session(user_id, target)
+            if not session:
+                print("Session not found for this user.")
+            else:
+                current_thread_id = session.thread_id
+                print(f"Switched to {session.app_name or session.session_type}: {session.thread_id}")
+            continue
         if not user_text:
             continue
-        state = append_user_message(state, user_text)
-        state = graph.invoke(state)
-        print(f"\nAssistant> {state.get('assistant_reply')}")
+        response = service.chat(user_id, user_text, current_thread_id)
+        current_thread_id = response.thread_id or current_thread_id
+        print(
+            f"\n[{response.current_app_name or response.session_type}] "
+            f"stage={response.stage} status={response.status} thread_id={response.thread_id}"
+        )
+        print(f"\nAssistant> {response.message}")
     return 0
 
 

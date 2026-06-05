@@ -158,6 +158,34 @@ def test_satisfied_feedback_generates_review_summary(tmp_path):
     assert result["draft_solution_json"]["tool_estimates"]["estimate_complexity"]["score"] >= 1
 
 
+def test_confirmed_solution_routes_to_tool_orchestration_subgraph(tmp_path):
+    llm = FakeLLM()
+    kb = KnowledgeBase(tmp_path / "kb.sqlite", embedder=llm)
+    kb.add_document("seed:smoking_detection.md", "smoking", "抽烟识别需要手口动作和烟雾误报过滤")
+    graph = build_graph(llm, kb, build_default_registry())
+
+    state = append_user_message(initial_state(), "我想做一个抽烟识别算法")
+    state = graph.invoke(state)
+    state = append_user_message(state, "满意，可以参考这个案例")
+    state = graph.invoke(state)
+    state = append_user_message(state, "确认")
+    result = graph.invoke(state)
+
+    assert result["status"] == "confirmed"
+    assert result["stage"] == "tool_orchestration"
+    assert result["active_agent"] == "tool_orchestration_agent"
+    assert result["next_agent"] == "end"
+    assert result["turn_complete"] is True
+    assert result["algorithm_main_description"]
+    assert "\n" not in result["algorithm_main_description"]
+    assert result["algorithm_main_description"].endswith("。")
+    assert result["tool_recall_result"]["query"] == result["algorithm_main_description"]
+    assert result["selected_tools"] == []
+    assert result["tool_topology"]["description"] == result["algorithm_main_description"]
+    assert result["tool_parameters"]["parameters"] == {}
+    assert result["orchestration_judgement"]["status"] == "placeholder_ready"
+
+
 def test_second_turn_updates_inputs_and_outputs(tmp_path):
     class IncrementalLLM(FakeLLM):
         def chat(self, messages, temperature=0.2):
