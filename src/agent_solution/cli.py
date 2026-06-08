@@ -28,6 +28,17 @@ def main(argv: list[str] | None = None) -> int:
     chat_parser.add_argument("--user-id", default="u_001", help="User identifier used for profile and session isolation.")
     chat_parser.add_argument("--thread-id", default=None, help="Resume an existing application thread.")
 
+    web_parser = subparsers.add_parser("web")
+    web_parser.add_argument("--host", default="127.0.0.1", help="Host for the local web demo server.")
+    web_parser.add_argument("--port", type=int, default=7860, help="Port for the local web demo server.")
+    web_parser.add_argument("--user-id", default="u_001", help="User identifier used for profile and session isolation.")
+    web_parser.add_argument("--thread-id", default=None, help="Resume an existing application thread.")
+    web_parser.add_argument(
+        "--real-model",
+        action="store_true",
+        help="Use the configured model API instead of deterministic local simulation.",
+    )
+
     demo_parser = subparsers.add_parser("demo")
     demo_parser.add_argument("demo_name", choices=["smoking"])
 
@@ -46,6 +57,18 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     settings = Settings.from_env()
+    if args.command == "web":
+        from agent_solution.web import run_web_server
+
+        return run_web_server(
+            settings,
+            host=args.host,
+            port=args.port,
+            user_id=args.user_id,
+            thread_id=args.thread_id,
+            real_model=args.real_model,
+        )
+
     llm = (
         SimulatedLLMClient()
         if getattr(args, "simulate", False) or args.command == "demo"

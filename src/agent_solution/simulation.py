@@ -41,6 +41,13 @@ class SimulatedLLMClient:
     def embed(self, texts: list[str]) -> list[list[float]]:
         return [_keyword_vector(text) for text in texts]
 
+    def describe_images(self, images: list[dict[str, Any]], user_text: str = "") -> str:
+        names = "、".join(str(image.get("name") or "未命名图片") for image in images) or "图片"
+        return (
+            f"已解析图片：{names}。图片看起来是园区固定摄像头场景，"
+            "需要关注人员抽烟行为、手口动作、香烟/烟雾线索、证据帧和置信度输出。"
+        )
+
 
 def _extract_slots(transcript: str) -> dict[str, str | None]:
     try:

@@ -319,6 +319,43 @@ agent-solution chat --user-id u_001 --thread-id u_001__smoking_detection__202606
 agent-solution tools list
 ```
 
+## 本地 Web 演示
+
+如果项目电脑无法打开 LangSmith/LangGraph Studio，可以直接启动本地轻量 Web 聊天页：
+
+```bash
+agent-solution web
+```
+
+然后在浏览器打开：
+
+```text
+http://127.0.0.1:7860
+```
+
+该页面默认使用本地仿真模式，不需要模型 API Key，也不依赖外部 Studio 页面。页面会展示聊天记录、当前应用、stage、status 和 thread_id，并支持切换已有应用会话。
+
+常用参数：
+
+```bash
+agent-solution web --host 127.0.0.1 --port 7860 --user-id u_001
+agent-solution web --thread-id <thread_id>
+```
+
+如果要调用配置好的真实模型 API：
+
+```bash
+export GREATROUTER_API_KEY="你的 API Key"
+agent-solution web --real-model
+```
+
+如果需要上传图片并让模型解析图片内容，可以单独指定视觉模型；未设置时会使用当前聊天模型兜底：
+
+```bash
+export GREATROUTER_VISION_MODEL="你的视觉模型名"
+agent-solution web --real-model
+```
+
 ## LangGraph CLI 运行
 
 项目已经提供 `langgraph.json`，可以用官方 LangGraph CLI 启动本地开发服务：

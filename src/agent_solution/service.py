@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from langchain_core.messages import HumanMessage, RemoveMessage
 from langgraph.checkpoint.memory import MemorySaver
@@ -25,6 +25,22 @@ def create_sqlite_checkpointer(path: str):
     ensure_parent(Path(path))
     connection = sqlite3.connect(path, check_same_thread=False)
     return SqliteSaver(connection)
+
+
+def _node_status_event(node_name: str, state: dict[str, Any]) -> dict[str, Any]:
+    labels = {
+        "supervisor_agent": "正在理解需求",
+        "knowledge_base_agent": "正在检索知识库",
+        "recommendation_agent": "正在生成推荐方案",
+        "tool_orchestration_agent": "正在编排工具链路",
+    }
+    return {
+        "type": "status",
+        "label": labels.get(node_name, "正在处理"),
+        "node": node_name,
+        "stage": state.get("stage"),
+        "active_agent": state.get("active_agent"),
+    }
 
 
 class AgentSolutionService:
@@ -53,6 +69,21 @@ class AgentSolutionService:
         user_input: str,
         current_thread_id: str | None = None,
     ) -> ChatResponse:
+        response = None
+        for event in self.stream_chat(user_id, user_input, current_thread_id):
+            if event["type"] == "result":
+                response = ChatResponse.model_validate(event["response"])
+        if response is None:
+            raise RuntimeError("Stream chat did not produce a final response.")
+        return response
+
+    def stream_chat(
+        self,
+        user_id: str,
+        user_input: str,
+        current_thread_id: str | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        yield {"type": "status", "label": "正在理解需求", "active_agent": "intent_router"}
         current_session = self.store.get_session(current_thread_id) if current_thread_id else None
         if current_session and current_session.user_id != user_id:
             current_session = None
@@ -66,7 +97,7 @@ class AgentSolutionService:
         )
         intent = IntentResult.model_validate(intent_result["intent"])
         if intent.switch_type in {"compare_apps", "general_recommendation"}:
-            return ChatResponse(
+            response = ChatResponse(
                 message="当前版本暂时只支持单个算法应用的方案咨询。请告诉我你希望先深入哪个具体算法应用。",
                 user_id=user_id,
                 thread_id=current_thread_id,
@@ -77,8 +108,10 @@ class AgentSolutionService:
                 status=current_session.status if current_session else None,
                 need_clarification=True,
             )
+            yield {"type": "result", "response": response.model_dump()}
+            return
         if intent.switch_type == "ambiguous":
-            return ChatResponse(
+            response = ChatResponse(
                 message="你是想继续当前算法应用，还是想咨询一个新的算法应用？请补充算法名称或业务场景。",
                 user_id=user_id,
                 thread_id=current_thread_id,
@@ -89,6 +122,8 @@ class AgentSolutionService:
                 status=current_session.status if current_session else None,
                 need_clarification=True,
             )
+            yield {"type": "result", "response": response.model_dump()}
+            return
 
         target_session = self.thread_manager.resolve_thread(user_id, intent, current_session)
         if not target_session:
@@ -122,12 +157,19 @@ class AgentSolutionService:
             graph_input.update(common)
             graph_input["messages"] = [HumanMessage(content=user_input)]
 
-        result = self.graph.invoke(graph_input, config=config)
+        result = None
+        for chunk in self.graph.stream(graph_input, config=config, stream_mode="updates"):
+            for node_name, update in chunk.items():
+                if isinstance(update, dict):
+                    result = update
+                    yield _node_status_event(node_name, update)
+        if result is None:
+            result = dict(self.graph.get_state(config).values)
         result = self._compact_messages(config, result)
         self.store.save_state(target_session, result)
         self.store.record_history(user_id, "ask", target_session.session_id, target_session.app_id)
         self._record_stage_history(user_id, target_session, result)
-        return ChatResponse(
+        response = ChatResponse(
             message=str(result.get("assistant_reply") or ""),
             user_id=user_id,
             thread_id=target_session.thread_id,
@@ -137,6 +179,7 @@ class AgentSolutionService:
             stage=str(result.get("stage") or target_session.stage),
             status=str(result.get("status") or target_session.status),
         )
+        yield {"type": "result", "response": response.model_dump()}
 
     def list_sessions(self, user_id: str) -> list[AppSession]:
         return self.store.list_sessions(user_id)

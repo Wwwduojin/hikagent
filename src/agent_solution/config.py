@@ -11,6 +11,7 @@ class Settings:
     model_base_url: str
     chat_model: str
     embed_model: str
+    vision_model: str | None = None
     api_key: str | None = None
     checkpoint_db_path: Path = Path(".agent_solution") / "checkpoints.sqlite"
     chunk_size: int = 900
@@ -28,6 +29,10 @@ class Settings:
     @property
     def vllm_embed_model(self) -> str:
         return self.embed_model
+
+    @property
+    def vllm_vision_model(self) -> str:
+        return self.vision_model or self.chat_model
 
     @property
     def vllm_api_key(self) -> str | None:
@@ -63,6 +68,12 @@ class Settings:
                 or os.getenv("GREATEROUTE_EMBED_MODEL")
                 or os.getenv("VLLM_EMBED_MODEL")
                 or "text-embedding-3-small"
+            ),
+            vision_model=(
+                os.getenv("GREATROUTER_VISION_MODEL")
+                or os.getenv("GREATEROUTE_VISION_MODEL")
+                or os.getenv("VLLM_VISION_MODEL")
+                or None
             ),
             api_key=api_key,
             chunk_size=int(os.getenv("AGENT_SOLUTION_CHUNK_SIZE", "900")),
